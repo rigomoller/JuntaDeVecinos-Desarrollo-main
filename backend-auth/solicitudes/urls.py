@@ -1,0 +1,86 @@
+from django.urls import path
+
+from .views import (
+    SolicitudDirectivaDetailView,
+    SolicitudDocumentoArchivoVecinoCreateView,
+    SolicitudDocumentoDirectivaDetailView,
+    SolicitudDocumentoDirectivaListView,
+    SolicitudDocumentoVecinoListCreateView,
+    SolicitudVecinoListCreateView,
+    SolicitudesDirectivaListView,
+    TipoDocumentoActivoListView,
+    SolicitudDocumentoArchivoDirectivaCreateView,
+    SolicitudDocumentoArchivoDownloadView,
+    SeguimientoSolicitudesVecinoView,
+    MarcarSolicitudVecinoRevisadaView,
+    MarcarSolicitudDocumentoRevisadaView,
+)
+
+urlpatterns = [
+    path(
+        "seguimiento/documento/<int:pk>/revisar/",
+        MarcarSolicitudDocumentoRevisadaView.as_view(),
+        name="marcar-solicitud-documento-revisada",
+    ),
+    path(
+        "seguimiento/vecinal/<int:pk>/revisar/",
+        MarcarSolicitudVecinoRevisadaView.as_view(),
+        name="marcar-solicitud-vecino-revisada",
+    ),
+    path(
+        "seguimiento/",
+        SeguimientoSolicitudesVecinoView.as_view(),
+        name="seguimiento-solicitudes-vecino",
+    ),
+    path(
+        "documentos/archivos/<int:pk>/descargar/",
+        SolicitudDocumentoArchivoDownloadView.as_view(),
+        name="solicitud-documento-archivo-download",
+    ),
+    path(
+        "directiva/documentos/<int:solicitud_id>/archivo-emitido/",
+        SolicitudDocumentoArchivoDirectivaCreateView.as_view(),
+        name="solicitud-documento-archivo-directiva-create",
+    ),
+    path(
+        "solicitudes/",
+        SolicitudVecinoListCreateView.as_view(),
+        name="solicitudes-vecino-list-create",
+    ),
+    path(
+        "directiva/solicitudes/",
+        SolicitudesDirectivaListView.as_view(),
+        name="solicitudes-directiva-list",
+    ),
+    path(
+        "directiva/solicitudes/<int:pk>/",
+        SolicitudDirectivaDetailView.as_view(),
+        name="solicitud-directiva-detail",
+    ),
+    # HU-12
+    path(
+        "tipos-documento/",
+        TipoDocumentoActivoListView.as_view(),
+        name="tipos-documento-activos",
+    ),
+    path(
+        "documentos/",
+        SolicitudDocumentoVecinoListCreateView.as_view(),
+        name="solicitudes-documento-vecino-list-create",
+    ),
+    path(
+        "documentos/<int:solicitud_id>/archivos/",
+        SolicitudDocumentoArchivoVecinoCreateView.as_view(),
+        name="solicitud-documento-archivo-vecino-create",
+    ),
+    path(
+        "directiva/documentos/",
+        SolicitudDocumentoDirectivaListView.as_view(),
+        name="solicitudes-documento-directiva-list",
+    ),
+    path(
+        "directiva/documentos/<int:pk>/",
+        SolicitudDocumentoDirectivaDetailView.as_view(),
+        name="solicitud-documento-directiva-detail",
+    ),
+]

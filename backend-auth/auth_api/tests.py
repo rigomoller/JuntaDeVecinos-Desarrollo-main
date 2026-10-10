@@ -1,0 +1,1211 @@
+from datetime import date
+
+from django.urls import reverse
+from rest_framework import status
+
+from organizacion.models import (
+    Cargo,
+    Directiva,
+    IntegranteDirectiva,
+    JuntaVecinos,
+    Sector,
+)
+from django.contrib.auth import get_user_model
+from django.contrib.auth.tokens import default_token_generator
+from django.core import mail
+from django.test import override_settings
+from django.utils.encoding import force_bytes
+from django.utils.http import urlsafe_base64_encode
+from rest_framework.test import APITestCase
+
+from profiles.models import (
+    EstadoUsuario,
+    HistorialGestionUsuario,
+    Perfil,
+    Rol,
+    UsuarioRol,
+)
+
+
+@override_settings(
+    ALLOWED_HOSTS=["testserver"],
+    EMAIL_BACKEND="django.core.mail.backends.locmem.EmailBackend",
+)
+class AutenticacionTests(APITestCase):
+
+    def setUp(self):
+        Usuario = get_user_model()
+
+        self.password = "PasswordSeguro123!"
+
+        self.usuario = Usuario.objects.create_user(
+            username="vecino_test",
+            email="vecino@test.cl",
+            password=self.password,
+        )
+
+        self.rol_vecino, _ = Rol.objects.get_or_create(
+            id=3,
+            defaults={
+                "nombre": "Vecino",
+            },
+        )
+
+        Perfil.objects.create(
+            usuario=self.usuario,
+            nombre_completo="Vecino Prueba",
+            rol=self.rol_vecino,
+            estado=EstadoUsuario.ACTIVO,
+        )
+
+        UsuarioRol.objects.get_or_create(
+            usuario=self.usuario,
+            rol=self.rol_vecino,
+            defaults={
+                "activo": True,
+            },
+        )
+
+    def test_login_correcto_crea_cookies_jwt(self):
+        response = self.client.post(
+            "/api/auth/login/",
+            {
+                "username": "vecino_test",
+                "password": self.password,
+                "recordar": False,
+            },
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, 200)
+
+        self.assertIn("access_token", response.cookies)
+        self.assertIn("refresh_token", response.cookies)
+
+        self.assertTrue(response.cookies["access_token"]["httponly"])
+
+        self.assertTrue(response.cookies["refresh_token"]["httponly"])
+
+    def test_login_con_password_incorrecta_rechazado(self):
+        response = self.client.post(
+            "/api/auth/login/",
+            {
+                "username": "vecino_test",
+                "password": "PasswordIncorrecto123!",
+                "recordar": False,
+            },
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, 401)
+
+    def test_sesion_sin_autenticacion_rechazada(self):
+        response = self.client.get(
+            "/api/auth/sesion/",
+        )
+
+        self.assertIn(
+            response.status_code,
+            [401, 403],
+        )
+
+    def test_sesion_autenticada_entrega_roles(self):
+        login_response = self.client.post(
+            "/api/auth/login/",
+            {
+                "username": "vecino_test",
+                "password": self.password,
+                "recordar": False,
+            },
+            format="json",
+        )
+
+        self.assertEqual(
+            login_response.status_code,
+            200,
+        )
+
+        response = self.client.get(
+            "/api/auth/sesion/",
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(
+            response.data["username"],
+            "vecino_test",
+        )
+        self.assertIn(
+            self.rol_vecino.id,
+            response.data["roles"],
+        )
+
+    def test_sesion_activa_es_rechazada_si_usuario_es_deshabilitado(self):
+        login_response = self.client.post(
+            "/api/auth/login/",
+            {
+                "username": "vecino_test",
+                "password": self.password,
+                "recordar": False,
+            },
+            format="json",
+        )
+
+        self.assertEqual(
+            login_response.status_code,
+            200,
+        )
+
+        self.usuario.is_active = False
+        self.usuario.save(
+            update_fields=[
+                "is_active",
+            ]
+        )
+
+        response = self.client.get(
+            "/api/auth/sesion/",
+        )
+
+        self.assertIn(
+            response.status_code,
+            [401, 403],
+        )
+
+    def test_refresh_token_renueva_access_token(self):
+        login_response = self.client.post(
+            "/api/auth/login/",
+            {
+                "username": "vecino_test",
+                "password": self.password,
+                "recordar": False,
+            },
+            format="json",
+        )
+
+        self.assertEqual(
+            login_response.status_code,
+            200,
+        )
+
+        self.client.cookies.pop(
+            "access_token",
+            None,
+        )
+
+        response = self.client.post(
+            "/api/auth/refresh/",
+            {},
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIn(
+            "access_token",
+            response.cookies,
+        )
+
+    def test_logout_elimina_cookies(self):
+        login_response = self.client.post(
+            "/api/auth/login/",
+            {
+                "username": "vecino_test",
+                "password": self.password,
+                "recordar": False,
+            },
+            format="json",
+        )
+
+        self.assertEqual(
+            login_response.status_code,
+            200,
+        )
+
+        response = self.client.post(
+            "/api/auth/logout/",
+            {},
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, 200)
+
+        self.assertEqual(
+            response.cookies["access_token"]["max-age"],
+            0,
+        )
+
+        self.assertEqual(
+            response.cookies["refresh_token"]["max-age"],
+            0,
+        )
+
+    def test_recuperacion_no_revela_si_email_existe(self):
+        response_existente = self.client.post(
+            "/api/auth/recuperar-password/",
+            {
+                "email": "vecino@test.cl",
+            },
+            format="json",
+        )
+
+        response_inexistente = self.client.post(
+            "/api/auth/recuperar-password/",
+            {
+                "email": "noexiste@test.cl",
+            },
+            format="json",
+        )
+
+        self.assertEqual(
+            response_existente.status_code,
+            200,
+        )
+
+        self.assertEqual(
+            response_inexistente.status_code,
+            200,
+        )
+
+        self.assertEqual(
+            response_existente.data["message"],
+            response_inexistente.data["message"],
+        )
+
+        self.assertEqual(len(mail.outbox), 1)
+
+    def test_restablecimiento_password_valido(self):
+        uid = urlsafe_base64_encode(force_bytes(self.usuario.pk))
+
+        token = default_token_generator.make_token(self.usuario)
+
+        nueva_password = "NuevaPassword456!"
+
+        response = self.client.post(
+            ("/api/auth/restablecer-password/" f"{uid}/{token}/"),
+            {
+                "password": nueva_password,
+                "confirmar_password": nueva_password,
+            },
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, 200)
+
+        self.usuario.refresh_from_db()
+
+        self.assertTrue(self.usuario.check_password(nueva_password))
+
+    def test_token_de_recuperacion_no_puede_reutilizarse(self):
+        uid = urlsafe_base64_encode(force_bytes(self.usuario.pk))
+
+        token = default_token_generator.make_token(self.usuario)
+
+        nueva_password = "NuevaPassword789!"
+
+        primera_respuesta = self.client.post(
+            ("/api/auth/restablecer-password/" f"{uid}/{token}/"),
+            {
+                "password": nueva_password,
+                "confirmar_password": nueva_password,
+            },
+            format="json",
+        )
+
+        segunda_respuesta = self.client.post(
+            ("/api/auth/restablecer-password/" f"{uid}/{token}/"),
+            {
+                "password": "OtraPassword789!",
+                "confirmar_password": "OtraPassword789!",
+            },
+            format="json",
+        )
+
+        self.assertEqual(
+            primera_respuesta.status_code,
+            200,
+        )
+
+        self.assertEqual(
+            segunda_respuesta.status_code,
+            400,
+        )
+
+    def test_registro_vecino_correcto_crea_usuario_y_rol(self):
+        response = self.client.post(
+            "/api/auth/registro/",
+            {
+                "username": "nuevo_vecino",
+                "rut": "12.345.678-5",
+                "nombres": "Nuevo",
+                "apellido_paterno": "Vecino",
+                "apellido_materno": "Prueba",
+                "email": "nuevo@vecino.cl",
+                "password": "PasswordNuevo123!",
+                "confirmar_password": "PasswordNuevo123!",
+            },
+            format="json",
+        )
+
+        self.assertEqual(
+            response.status_code,
+            201,
+        )
+
+        Usuario = get_user_model()
+
+        usuario = Usuario.objects.get(username="nuevo_vecino")
+
+        self.assertTrue(usuario.is_active)
+
+        self.assertEqual(
+            usuario.rut,
+            "12345678-5",
+        )
+
+        self.assertTrue(
+            UsuarioRol.objects.filter(
+                usuario=usuario,
+                rol=self.rol_vecino,
+                activo=True,
+            ).exists()
+        )
+
+        self.assertFalse(Perfil.objects.filter(usuario=usuario).exists())
+
+        login_response = self.client.post(
+            "/api/auth/login/",
+            {
+                "username": "nuevo_vecino",
+                "password": "PasswordNuevo123!",
+                "recordar": False,
+            },
+            format="json",
+        )
+
+        self.assertEqual(
+            login_response.status_code,
+            200,
+        )
+
+    def test_registro_vecino_rechaza_rut_invalido(self):
+        response = self.client.post(
+            "/api/auth/registro/",
+            {
+                "username": "vecino_rut_invalido",
+                "rut": "12.345.678-9",
+                "nombres": "Vecino",
+                "apellido_paterno": "Prueba",
+                "email": "rut@invalido.cl",
+                "password": "PasswordNuevo123!",
+                "confirmar_password": "PasswordNuevo123!",
+            },
+            format="json",
+        )
+
+        self.assertEqual(
+            response.status_code,
+            400,
+        )
+
+        self.assertIn(
+            "rut",
+            response.data,
+        )
+
+    def test_registro_vecino_rechaza_email_duplicado(self):
+        response = self.client.post(
+            "/api/auth/registro/",
+            {
+                "username": "otro_vecino",
+                "rut": "11.111.111-1",
+                "nombres": "Otro",
+                "apellido_paterno": "Vecino",
+                "email": "vecino@test.cl",
+                "password": "PasswordNuevo123!",
+                "confirmar_password": "PasswordNuevo123!",
+            },
+            format="json",
+        )
+
+        self.assertEqual(
+            response.status_code,
+            400,
+        )
+
+        self.assertIn(
+            "email",
+            response.data,
+        )
+
+    def test_registro_vecino_rechaza_passwords_distintos(self):
+        response = self.client.post(
+            "/api/auth/registro/",
+            {
+                "username": "vecino_password",
+                "rut": "12.345.678-5",
+                "nombres": "Vecino",
+                "apellido_paterno": "Password",
+                "email": "password@vecino.cl",
+                "password": "PasswordNuevo123!",
+                "confirmar_password": "OtraPassword123!",
+            },
+            format="json",
+        )
+
+        self.assertEqual(
+            response.status_code,
+            400,
+        )
+
+        self.assertIn(
+            "confirmar_password",
+            response.data,
+        )
+
+    def test_perfil_requiere_autenticacion(self):
+        response = self.client.get("/api/auth/perfil/")
+
+        self.assertIn(
+            response.status_code,
+            [401, 403],
+        )
+
+    def test_perfil_autenticado_entrega_datos_usuario(self):
+        self.client.post(
+            "/api/auth/login/",
+            {
+                "username": "vecino_test",
+                "password": self.password,
+                "recordar": False,
+            },
+            format="json",
+        )
+
+        response = self.client.get("/api/auth/perfil/")
+
+        self.assertEqual(
+            response.status_code,
+            200,
+        )
+
+        self.assertEqual(
+            response.data["username"],
+            "vecino_test",
+        )
+
+        self.assertEqual(
+            response.data["email"],
+            "vecino@test.cl",
+        )
+
+    def test_perfil_permite_actualizar_fecha_nacimiento(self):
+        self.client.post(
+            "/api/auth/login/",
+            {
+                "username": "vecino_test",
+                "password": self.password,
+                "recordar": False,
+            },
+            format="json",
+        )
+
+        response = self.client.patch(
+            "/api/auth/perfil/",
+            {
+                "fecha_nacimiento": "1995-06-15",
+            },
+            format="json",
+        )
+
+        self.assertEqual(
+            response.status_code,
+            200,
+        )
+
+        self.usuario.refresh_from_db()
+
+        self.assertEqual(
+            str(self.usuario.fecha_nacimiento),
+            "1995-06-15",
+        )
+
+    def test_perfil_no_permite_modificar_rut(self):
+        self.client.post(
+            "/api/auth/login/",
+            {
+                "username": "vecino_test",
+                "password": self.password,
+                "recordar": False,
+            },
+            format="json",
+        )
+
+        rut_original = self.usuario.rut
+
+        response = self.client.patch(
+            "/api/auth/perfil/",
+            {
+                "rut": "12345678-5",
+            },
+            format="json",
+        )
+
+        self.assertEqual(
+            response.status_code,
+            200,
+        )
+
+        self.usuario.refresh_from_db()
+
+        self.assertEqual(
+            self.usuario.rut,
+            rut_original,
+        )
+
+    def test_administrador_puede_listar_usuarios(self):
+        rol_admin, _ = Rol.objects.get_or_create(nombre="Administrador")
+
+        UsuarioRol.objects.update_or_create(
+            usuario=self.usuario,
+            rol=rol_admin,
+            defaults={
+                "activo": True,
+            },
+        )
+
+        self.client.force_authenticate(user=self.usuario)
+
+        response = self.client.get("/api/auth/admin/usuarios/")
+
+        self.assertEqual(
+            response.status_code,
+            200,
+        )
+
+        self.assertGreaterEqual(
+            len(response.data),
+            1,
+        )
+
+        self.assertEqual(
+            response.data[0]["username"],
+            self.usuario.username,
+        )
+
+    def test_vecino_no_puede_listar_usuarios_administrativos(self):
+        self.client.force_authenticate(user=self.usuario)
+
+        response = self.client.get("/api/auth/admin/usuarios/")
+
+        self.assertIn(
+            response.status_code,
+            [401, 403],
+        )
+
+    def test_administrador_puede_deshabilitar_cuenta_usuario(self):
+        Usuario = get_user_model()
+
+        rol_admin, _ = Rol.objects.get_or_create(nombre="Administrador")
+
+        UsuarioRol.objects.update_or_create(
+            usuario=self.usuario,
+            rol=rol_admin,
+            defaults={
+                "activo": True,
+            },
+        )
+
+        otro_usuario = Usuario.objects.create_user(
+            username="usuario_deshabilitar",
+            email="deshabilitar@test.cl",
+            password="PasswordSeguro123!",
+            is_active=True,
+        )
+
+        self.client.force_authenticate(user=self.usuario)
+
+        response = self.client.patch(
+            f"/api/auth/admin/usuarios/{otro_usuario.id}/estado/",
+            {
+                "is_active": False,
+            },
+            format="json",
+        )
+
+        self.assertEqual(
+            response.status_code,
+            200,
+        )
+
+        otro_usuario.refresh_from_db()
+
+        self.assertFalse(otro_usuario.is_active)
+        historial = HistorialGestionUsuario.objects.get(
+            usuario_objetivo=otro_usuario,
+            tipo_cambio=(HistorialGestionUsuario.TipoCambio.ESTADO_CUENTA),
+        )
+
+        self.assertEqual(
+            historial.realizado_por,
+            self.usuario,
+        )
+
+        self.assertEqual(
+            historial.valor_anterior,
+            "HABILITADA",
+        )
+
+        self.assertEqual(
+            historial.valor_nuevo,
+            "DESHABILITADA",
+        )
+    def test_administrador_no_puede_deshabilitar_su_propia_cuenta(self):
+        rol_admin, _ = Rol.objects.get_or_create(
+            nombre="Administrador"
+        )
+
+        UsuarioRol.objects.update_or_create(
+            usuario=self.usuario,
+            rol=rol_admin,
+            defaults={
+                "activo": True,
+            },
+        )
+
+        self.client.force_authenticate(
+            user=self.usuario
+        )
+
+        response = self.client.patch(
+            (
+                f"/api/auth/admin/usuarios/"
+                f"{self.usuario.id}/estado/"
+            ),
+            {
+                "is_active": False,
+            },
+            format="json",
+        )
+
+        self.assertEqual(
+            response.status_code,
+            status.HTTP_400_BAD_REQUEST,
+        )
+
+        self.usuario.refresh_from_db()
+
+        self.assertTrue(
+            self.usuario.is_active
+    )
+    def test_administrador_puede_habilitar_cuenta_usuario(self):
+        Usuario = get_user_model()
+
+        rol_admin, _ = Rol.objects.get_or_create(nombre="Administrador")
+
+        UsuarioRol.objects.update_or_create(
+            usuario=self.usuario,
+            rol=rol_admin,
+            defaults={
+                "activo": True,
+            },
+        )
+
+        otro_usuario = Usuario.objects.create_user(
+            username="usuario_habilitar",
+            email="habilitar@test.cl",
+            password="PasswordSeguro123!",
+            is_active=False,
+        )
+
+        self.client.force_authenticate(user=self.usuario)
+
+        response = self.client.patch(
+            f"/api/auth/admin/usuarios/{otro_usuario.id}/estado/",
+            {
+                "is_active": True,
+            },
+            format="json",
+        )
+
+        self.assertEqual(
+            response.status_code,
+            200,
+        )
+
+        otro_usuario.refresh_from_db()
+
+        self.assertTrue(otro_usuario.is_active)
+
+    def test_administrador_no_puede_desactivar_su_propio_rol(self):
+            rol_admin, _ = Rol.objects.get_or_create(
+                nombre="Administrador"
+            )
+
+            UsuarioRol.objects.update_or_create(
+                usuario=self.usuario,
+                rol=rol_admin,
+                defaults={
+                    "activo": True,
+                },
+            )
+
+            self.client.force_authenticate(
+                user=self.usuario
+            )
+
+            response = self.client.patch(
+                (
+                    f"/api/auth/admin/usuarios/"
+                    f"{self.usuario.id}/rol/"
+                ),
+                {
+                    "rol_id": rol_admin.id,
+                    "activo": False,
+                },
+                format="json",
+            )
+
+            self.assertEqual(
+                response.status_code,
+                status.HTTP_400_BAD_REQUEST,
+            )
+
+            asignacion = UsuarioRol.objects.get(
+                usuario=self.usuario,
+                rol=rol_admin,
+            )
+
+            self.assertTrue(
+                asignacion.activo
+            )
+
+    def test_vecino_no_puede_cambiar_estado_cuenta_usuario(self):
+        Usuario = get_user_model()
+
+        otro_usuario = Usuario.objects.create_user(
+            username="usuario_protegido",
+            email="protegido@test.cl",
+            password="PasswordSeguro123!",
+            is_active=True,
+        )
+
+        self.client.force_authenticate(user=self.usuario)
+
+        response = self.client.patch(
+            f"/api/auth/admin/usuarios/{otro_usuario.id}/estado/",
+            {
+                "is_active": False,
+            },
+            format="json",
+        )
+
+        self.assertIn(
+            response.status_code,
+            [401, 403],
+        )
+
+        otro_usuario.refresh_from_db()
+
+        self.assertTrue(otro_usuario.is_active)
+
+    def test_administrador_puede_activar_rol_usuario(self):
+        Usuario = get_user_model()
+
+        rol_admin, _ = Rol.objects.get_or_create(nombre="Administrador")
+
+        rol_directiva, _ = Rol.objects.get_or_create(nombre="Directiva")
+
+        UsuarioRol.objects.update_or_create(
+            usuario=self.usuario,
+            rol=rol_admin,
+            defaults={
+                "activo": True,
+            },
+        )
+
+        otro_usuario = Usuario.objects.create_user(
+            username="usuario_rol_test",
+            email="usuario.rol@test.cl",
+            password="PasswordSeguro123!",
+        )
+
+        UsuarioRol.objects.create(
+            usuario=otro_usuario,
+            rol=self.rol_vecino,
+            activo=True,
+        )
+
+        self.client.force_authenticate(user=self.usuario)
+
+        response = self.client.patch(
+            f"/api/auth/admin/usuarios/{otro_usuario.id}/rol/",
+            {
+                "rol_id": rol_directiva.id,
+                "activo": True,
+            },
+            format="json",
+        )
+
+        self.assertEqual(
+            response.status_code,
+            200,
+        )
+
+        self.assertTrue(
+            UsuarioRol.objects.filter(
+                usuario=otro_usuario,
+                rol=rol_directiva,
+                activo=True,
+            ).exists()
+        )
+
+        self.assertTrue(
+            UsuarioRol.objects.filter(
+                usuario=otro_usuario,
+                rol=self.rol_vecino,
+                activo=True,
+            ).exists()
+        )
+        historial = HistorialGestionUsuario.objects.get(
+            usuario_objetivo=otro_usuario,
+            tipo_cambio=(HistorialGestionUsuario.TipoCambio.ROL),
+        )
+
+        self.assertEqual(
+            historial.realizado_por,
+            self.usuario,
+        )
+
+        self.assertEqual(
+            historial.valor_anterior,
+            "NO_ASIGNADO",
+        )
+
+        self.assertEqual(
+            historial.valor_nuevo,
+            "ACTIVO",
+        )
+
+        self.assertEqual(
+            historial.detalle,
+            "Rol: Directiva",
+        )
+
+    def test_administrador_puede_desactivar_rol_usuario(self):
+        Usuario = get_user_model()
+
+        rol_admin, _ = Rol.objects.get_or_create(nombre="Administrador")
+
+        rol_directiva, _ = Rol.objects.get_or_create(nombre="Directiva")
+
+        UsuarioRol.objects.update_or_create(
+            usuario=self.usuario,
+            rol=rol_admin,
+            defaults={
+                "activo": True,
+            },
+        )
+
+        otro_usuario = Usuario.objects.create_user(
+            username="usuario_desactivar_rol",
+            email="desactivar.rol@test.cl",
+            password="PasswordSeguro123!",
+        )
+
+        UsuarioRol.objects.create(
+            usuario=otro_usuario,
+            rol=self.rol_vecino,
+            activo=True,
+        )
+
+        UsuarioRol.objects.create(
+            usuario=otro_usuario,
+            rol=rol_directiva,
+            activo=True,
+        )
+
+        self.client.force_authenticate(user=self.usuario)
+
+        response = self.client.patch(
+            f"/api/auth/admin/usuarios/{otro_usuario.id}/rol/",
+            {
+                "rol_id": rol_directiva.id,
+                "activo": False,
+            },
+            format="json",
+        )
+
+        self.assertEqual(
+            response.status_code,
+            200,
+        )
+
+        rol_directiva_usuario = UsuarioRol.objects.get(
+            usuario=otro_usuario,
+            rol=rol_directiva,
+        )
+
+        self.assertFalse(rol_directiva_usuario.activo)
+        historial = HistorialGestionUsuario.objects.get(
+            usuario_objetivo=otro_usuario,
+            tipo_cambio=(HistorialGestionUsuario.TipoCambio.ROL),
+        )
+
+        self.assertEqual(
+            historial.realizado_por,
+            self.usuario,
+        )
+
+        self.assertEqual(
+            historial.valor_anterior,
+            "ACTIVO",
+        )
+
+        self.assertEqual(
+            historial.valor_nuevo,
+            "INACTIVO",
+        )
+
+        self.assertEqual(
+            historial.detalle,
+            "Rol: Directiva",
+        )
+
+        self.assertTrue(
+            UsuarioRol.objects.filter(
+                usuario=otro_usuario,
+                rol=self.rol_vecino,
+                activo=True,
+            ).exists()
+        )
+
+    def test_no_puede_desactivar_rol_directiva_con_cargo_activo(self):
+        Usuario = get_user_model()
+
+        rol_admin, _ = Rol.objects.get_or_create(nombre="Administrador")
+
+        rol_directiva, _ = Rol.objects.get_or_create(nombre="Directiva")
+
+        UsuarioRol.objects.update_or_create(
+            usuario=self.usuario,
+            rol=rol_admin,
+            defaults={
+                "activo": True,
+            },
+        )
+
+        junta = JuntaVecinos.objects.create(
+            nombre="Junta Rol Directiva Test",
+            comuna="Puente Alto",
+            activa=True,
+        )
+
+        sector = Sector.objects.create(
+            junta_vecinos=junta,
+            nombre="Sector Rol Directiva Test",
+            activo=True,
+        )
+
+        usuario_directiva = Usuario.objects.create_user(
+            username="directiva_cargo_activo",
+            email="directiva.cargo@test.cl",
+            password="PasswordSeguro123!",
+            rut="33333333-3",
+            nombres="Usuario",
+            apellido_paterno="Directiva",
+            sector=sector,
+            estado_asociacion_sector="CONFIRMADA",
+        )
+
+        UsuarioRol.objects.create(
+            usuario=usuario_directiva,
+            rol=self.rol_vecino,
+            activo=True,
+        )
+
+        UsuarioRol.objects.create(
+            usuario=usuario_directiva,
+            rol=rol_directiva,
+            activo=True,
+        )
+
+        cargo = Cargo.objects.create(
+            nombre="Presidente",
+            descripcion="Presidencia de la junta",
+            permite_multiples=False,
+            activo=True,
+        )
+
+        directiva = Directiva.objects.create(
+            junta_vecinos=junta,
+            fecha_inicio=date(2026, 1, 1),
+            estado=Directiva.EstadoDirectiva.VIGENTE,
+        )
+
+        IntegranteDirectiva.objects.create(
+            directiva=directiva,
+            usuario=usuario_directiva,
+            cargo=cargo,
+            fecha_inicio=date(2026, 1, 1),
+            activo=True,
+        )
+
+        self.client.force_authenticate(user=self.usuario)
+
+        response = self.client.patch(
+            f"/api/auth/admin/usuarios/{usuario_directiva.id}/rol/",
+            {
+                "rol_id": rol_directiva.id,
+                "activo": False,
+            },
+            format="json",
+        )
+
+        self.assertEqual(
+            response.status_code,
+            status.HTTP_400_BAD_REQUEST,
+        )
+
+        asignacion = UsuarioRol.objects.get(
+            usuario=usuario_directiva,
+            rol=rol_directiva,
+        )
+
+        self.assertTrue(asignacion.activo)
+
+        self.assertFalse(
+            HistorialGestionUsuario.objects.filter(
+                usuario_objetivo=usuario_directiva,
+                tipo_cambio=(HistorialGestionUsuario.TipoCambio.ROL),
+            ).exists()
+        )
+
+    def test_vecino_no_puede_modificar_roles_usuario(self):
+        Usuario = get_user_model()
+
+        rol_directiva, _ = Rol.objects.get_or_create(nombre="Directiva")
+
+        otro_usuario = Usuario.objects.create_user(
+            username="usuario_rol_protegido",
+            email="rol.protegido@test.cl",
+            password="PasswordSeguro123!",
+        )
+
+        UsuarioRol.objects.create(
+            usuario=otro_usuario,
+            rol=self.rol_vecino,
+            activo=True,
+        )
+
+        self.client.force_authenticate(user=self.usuario)
+
+        response = self.client.patch(
+            f"/api/auth/admin/usuarios/{otro_usuario.id}/rol/",
+            {
+                "rol_id": rol_directiva.id,
+                "activo": True,
+            },
+            format="json",
+        )
+
+        self.assertIn(
+            response.status_code,
+            [401, 403],
+        )
+
+        self.assertFalse(
+            UsuarioRol.objects.filter(
+                usuario=otro_usuario,
+                rol=rol_directiva,
+                activo=True,
+            ).exists()
+        )
+
+    def test_administrador_no_puede_asignar_rol_no_permitido(self):
+        Usuario = get_user_model()
+
+        rol_admin, _ = Rol.objects.get_or_create(nombre="Administrador")
+
+        UsuarioRol.objects.update_or_create(
+            usuario=self.usuario,
+            rol=rol_admin,
+            defaults={
+                "activo": True,
+            },
+        )
+
+        otro_usuario = Usuario.objects.create_user(
+            username="usuario_rol_no_permitido",
+            email="rol.no.permitido@test.cl",
+            password="PasswordSeguro123!",
+        )
+
+        rol_no_permitido = Rol.objects.create(nombre="SupervisorPrueba")
+
+        self.client.force_authenticate(user=self.usuario)
+
+        response = self.client.patch(
+            f"/api/auth/admin/usuarios/{otro_usuario.id}/rol/",
+            {
+                "rol_id": rol_no_permitido.id,
+                "activo": True,
+            },
+            format="json",
+        )
+
+        self.assertEqual(
+            response.status_code,
+            status.HTTP_400_BAD_REQUEST,
+        )
+
+        self.assertFalse(
+            UsuarioRol.objects.filter(
+                usuario=otro_usuario,
+                rol=rol_no_permitido,
+            ).exists()
+        )
+
+
+    def test_administrador_puede_listar_roles_permitidos(self):
+        rol_admin, _ = Rol.objects.get_or_create(nombre="Administrador")
+
+        Rol.objects.get_or_create(nombre="Directiva")
+
+        Rol.objects.get_or_create(nombre="Vecino")
+
+        Rol.objects.get_or_create(nombre="Municipal")
+
+        Rol.objects.get_or_create(nombre="SupervisorPrueba")
+
+        UsuarioRol.objects.update_or_create(
+            usuario=self.usuario,
+            rol=rol_admin,
+            defaults={
+                "activo": True,
+            },
+        )
+
+        self.client.force_authenticate(user=self.usuario)
+
+        response = self.client.get("/api/auth/admin/roles/")
+
+        self.assertEqual(
+            response.status_code,
+            status.HTTP_200_OK,
+        )
+
+        nombres = {rol["nombre"] for rol in response.data}
+
+        self.assertEqual(
+            nombres,
+            {
+                "Administrador",
+                "Directiva",
+                "Vecino",
+                "Municipal",
+            },
+        )
+
+        self.assertNotIn(
+            "SupervisorPrueba",
+            nombres,
+        )
